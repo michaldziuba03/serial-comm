@@ -9,7 +9,10 @@ add_executable(rs
   src/main.cc
 )
 
-target_include_directories(rs
-  PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/src
+add_subdirectory(deps/ftxui)
+
+target_link_libraries(rs
+  PRIVATE ftxui::screen
+  PRIVATE ftxui::dom
+  PRIVATE ftxui::component
 )
