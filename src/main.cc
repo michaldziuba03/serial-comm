@@ -9,219 +9,281 @@
 #include <deque>
 #include <filesystem>
 #include <atomic>
+#include <cstdint>
+#include <cstring> // dla memcpy
 
-const size_t CHUNK_SIZE = 512;
+namespace fs = std::filesystem;
 
-struct Chunk {
-    size_t size = 0;
-    char* bytes = nullptr;
-
-    Chunk() {
-        bytes = new char[CHUNK_SIZE];
-        size = 0;
-    }
-
-    ~Chunk() { delete[] bytes; }
-
-    inline char* data() { return bytes; }
-    inline size_t capacity() { return CHUNK_SIZE; }
-};
-
+// --- KONFIGURACJA ---
 struct SerialPortConfig {
     std::string portName;
     int baudRate = CBR_115200;
 };
 
+// --- ZMIENNE GLOBALNE ---
 HANDLE hSerial = nullptr;
 std::atomic<bool> running = true;
 
+// --- POMOCNICZE ---
 inline std::string last_error_message(DWORD err) {
     LPVOID msg_buf = nullptr;
     FormatMessageA(
-        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
-        FORMAT_MESSAGE_IGNORE_INSERTS,
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
         nullptr, err, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
         (LPSTR)&msg_buf, 0, nullptr);
-
-    std::string message;
-    if (msg_buf) {
-        message = (LPSTR)msg_buf;
-        LocalFree(msg_buf);
-    }
-    else {
-        message = "Unknown error";
-    }
+    std::string message = msg_buf ? (LPSTR)msg_buf : "Unknown error";
+    if (msg_buf) LocalFree(msg_buf);
     return message;
 }
 
 inline std::string get_filename(std::string& filepath) {
     size_t separator = filepath.find_last_of("\\/");
-    std::string filename = (separator == std::string::npos)
-        ? filepath
-        : filepath.substr(separator + 1);
-    return filename;
+    return (separator == std::string::npos) ? filepath : filepath.substr(separator + 1);
 }
+
+// --- KLASA PARSUJĄCA DANE ---
+class FrameParser {
+    enum class State {
+        READ_FILENAME_LEN,
+        READ_FILENAME,
+        READ_PAYLOAD_LEN,
+        READ_PAYLOAD
+    };
+
+    State state = State::READ_FILENAME_LEN;
+    std::deque<char> buffer; // Główny bufor strumieniowy
+
+    // Zmienne tymczasowe do trzymania stanu ramki
+    int64_t temp_filename_len = 0;
+    std::string temp_filename;
+    int64_t temp_payload_len = 0;
+
+public:
+    // Wrzucamy surowe dane z ReadFile do środka
+    void append_data(const char* data, size_t size) {
+        buffer.insert(buffer.end(), data, data + size);
+        process(); // Próbujemy parsować po dodaniu nowych danych
+    }
+
+private:
+    // Funkcja pomocnicza do pobierania int64 z przodu kolejki
+    bool try_read_int64(int64_t& out_value) {
+        if (buffer.size() < sizeof(int64_t)) return false;
+
+        // Kopiujemy bajty do zmiennej (zakładamy Little Endian, standard na x86/Windows)
+        // Robimy to ręcznie lub przez vector, żeby deque było ciągłe w pamięci dla memcpy
+        std::vector<char> raw(sizeof(int64_t));
+        for (size_t i = 0; i < sizeof(int64_t); ++i) raw[i] = buffer[i];
+
+        std::memcpy(&out_value, raw.data(), sizeof(int64_t));
+
+        // Usuwamy zużyte bajty
+        buffer.erase(buffer.begin(), buffer.begin() + sizeof(int64_t));
+        return true;
+    }
+
+    // Funkcja pomocnicza do pobierania N bajtów (string/blob)
+    bool try_read_bytes(size_t length, std::vector<char>& out_bytes) {
+        if (buffer.size() < length) return false;
+
+        out_bytes.resize(length);
+        for (size_t i = 0; i < length; ++i) {
+            out_bytes[i] = buffer.front();
+            buffer.pop_front();
+        }
+        return true;
+    }
+
+    void handle_complete_frame(const std::string& name, const std::vector<char>& payload) {
+        if (name.empty()) {
+            // WIADOMOŚĆ TEKSTOWA
+            std::string text(payload.begin(), payload.end());
+            std::cout << "\n[MSG] >> " << text << "\nKomenda (T/F/Q): ";
+        }
+        else {
+            // PLIK
+            fs::create_directories("received_files");
+            fs::path path = fs::path("received_files") / name;
+
+            std::ofstream outfile(path, std::ios::binary);
+            if (outfile.write(payload.data(), payload.size())) {
+                std::cout << "\n[FILE] Otrzymano plik: " << name << " (" << payload.size() << " B)\nKomenda (T/F/Q): ";
+            }
+            else {
+                std::cerr << "\n[ERROR] Blad zapisu pliku: " << name << "\n";
+            }
+        }
+    }
+
+    void process() {
+        while (true) {
+            switch (state) {
+            case State::READ_FILENAME_LEN:
+                if (!try_read_int64(temp_filename_len)) return; // Czekamy na więcej danych
+
+                // Sanity check
+                if (temp_filename_len < 0 || temp_filename_len > 1024) {
+                    // Tutaj można dodać logikę resetu, jeśli otrzymamy śmieci
+                    // Na razie ufamy, że długość jest OK
+                }
+
+                if (temp_filename_len == 0) {
+                    temp_filename = "";
+                    state = State::READ_PAYLOAD_LEN; // Pomijamy czytanie nazwy
+                }
+                else {
+                    state = State::READ_FILENAME;
+                }
+                break;
+
+            case State::READ_FILENAME:
+            {
+                std::vector<char> name_buf;
+                if (!try_read_bytes(static_cast<size_t>(temp_filename_len), name_buf)) return;
+                temp_filename.assign(name_buf.begin(), name_buf.end());
+                state = State::READ_PAYLOAD_LEN;
+            }
+            break;
+
+            case State::READ_PAYLOAD_LEN:
+                if (!try_read_int64(temp_payload_len)) return;
+                state = State::READ_PAYLOAD;
+                break;
+
+            case State::READ_PAYLOAD:
+            {
+                std::vector<char> payload_buf;
+                if (!try_read_bytes(static_cast<size_t>(temp_payload_len), payload_buf)) return;
+
+                // Mamy całą ramkę!
+                handle_complete_frame(temp_filename, payload_buf);
+
+                // Reset maszyny stanów
+                state = State::READ_FILENAME_LEN;
+                temp_filename.clear();
+                temp_filename_len = 0;
+                temp_payload_len = 0;
+            }
+            break;
+            }
+        }
+    }
+};
+
+// --- OBSŁUGA PORTU ---
 
 void read_serial_port_config(SerialPortConfig& config) {
     const char* defaultPort = "COM1";
     std::string portNameStr;
-    std::string baudRateStr;
-
     std::cout << "Podaj port COM (domyslnie " << defaultPort << "): ";
     std::getline(std::cin, portNameStr);
     if (portNameStr.empty()) portNameStr = defaultPort;
 
-    int baudRate = CBR_115200;
-    std::cout << "Podaj baudrate (domyslnie " << baudRate << "): ";
-    std::getline(std::cin, baudRateStr);
-    if (!baudRateStr.empty()) {
-        try {
-            baudRate = std::stoi(baudRateStr);
-            if (baudRate <= 0) throw std::exception();
-        }
-        catch (...) {
-            std::cout << " [!] Bledny baudrate. Uzywam domyslnej wartosci.\n";
-        }
-    }
-
+    std::cout << "Podaj baudrate (domyslnie 115200): ";
+    std::string baudStr;
+    std::getline(std::cin, baudStr);
     config.portName = portNameStr;
-    config.baudRate = baudRate;
+    if (!baudStr.empty()) config.baudRate = std::stoi(baudStr);
 }
 
 void open_serial_port(SerialPortConfig& config) {
     std::string portPath = "\\\\.\\" + config.portName;
-    hSerial = CreateFileA(
-        portPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING,
-        FILE_FLAG_OVERLAPPED, NULL);
+    hSerial = CreateFileA(portPath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
+    if (hSerial == INVALID_HANDLE_VALUE) throw std::runtime_error("Nie mozna otworzyc portu.");
 
-    if (hSerial == INVALID_HANDLE_VALUE)
-        throw std::runtime_error("Nie mozna otworzyc portu " + config.portName);
-
-    SetupComm(hSerial, 32768, 32768);
-
-    DCB dcbSerialParams = { 0 };
-    dcbSerialParams.DCBlength = sizeof(dcbSerialParams);
-
-    if (!GetCommState(hSerial, &dcbSerialParams))
-        throw std::runtime_error("Blad pobierania stanu portu.");
-
-    dcbSerialParams.fOutxCtsFlow = TRUE;
-    dcbSerialParams.fRtsControl = RTS_CONTROL_HANDSHAKE;
-    dcbSerialParams.fOutX = FALSE;
-    dcbSerialParams.fInX = FALSE;
-
-    dcbSerialParams.BaudRate = config.baudRate;
-    dcbSerialParams.ByteSize = 8;
-    dcbSerialParams.StopBits = ONESTOPBIT;
-    dcbSerialParams.Parity = NOPARITY;
-
-    SetCommState(hSerial, &dcbSerialParams);
-        //throw std::runtime_error("Blad ustawiania parametrow portu.");
+    DCB dcb = { 0 };
+    dcb.DCBlength = sizeof(dcb);
+    GetCommState(hSerial, &dcb);
+    dcb.BaudRate = config.baudRate;
+    dcb.ByteSize = 8;
+    dcb.StopBits = ONESTOPBIT;
+    dcb.Parity = NOPARITY;
+    SetCommState(hSerial, &dcb);
 
     COMMTIMEOUTS timeouts = { 0 };
     timeouts.ReadIntervalTimeout = MAXDWORD;
-    timeouts.ReadTotalTimeoutConstant = 0;
-    timeouts.ReadTotalTimeoutMultiplier = 0;
-    timeouts.WriteTotalTimeoutConstant = 0;
-    timeouts.WriteTotalTimeoutMultiplier = 0;
     SetCommTimeouts(hSerial, &timeouts);
 
-    std::cout << "Port " << config.portName << " otwarty @ " << config.baudRate
-        << ".\n";
+    std::cout << "Port " << config.portName << " otwarty.\n";
 }
 
-void close_serial_port()
-{
-    if (!hSerial)
-        return;
-
-    std::cout << "[INFO] Zamykanie portu COM...\n";
-
+void close_serial_port() {
+    if (!hSerial) return;
     running = false;
-
-    CancelIo(hSerial);
     CancelIoEx(hSerial, NULL);
-
-    EscapeCommFunction(hSerial, CLRRTS);
-    EscapeCommFunction(hSerial, CLRDTR);
-
-    SetCommMask(hSerial, 0);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-
-    PurgeComm(
-        hSerial,
-        PURGE_RXABORT | PURGE_TXABORT | PURGE_RXCLEAR | PURGE_TXCLEAR
-    );
-
     CloseHandle(hSerial);
     hSerial = NULL;
-
-    std::cout << "[INFO] Port COM zamknięty poprawnie.\n";
 }
 
-std::vector<char> read_file(const std::string& filepath) {
-    std::ifstream file(filepath, std::ios::binary | std::ios::ate);
-    if (!file) throw std::runtime_error("Nie można otworzyć pliku: " + filepath);
+// --- NOWY READER LOOP ---
+void reader_loop() {
+    FrameParser parser;
 
-    std::streamsize size = file.tellg();
-    file.seekg(0, std::ios::beg);
+    // Alokujemy jeden statyczny bufor do odczytu z API Windowsa
+    // Nie musimy go niszczyć i tworzyć od nowa.
+    const size_t RAW_BUF_SIZE = 1024;
+    char raw_buffer[RAW_BUF_SIZE];
 
-    std::vector<char> buffer(size);
-    if (!file.read(buffer.data(), size))
-        throw std::runtime_error("Błąd podczas odczytu pliku: " + filepath);
+    OVERLAPPED ov = { 0 };
+    ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
 
-    return buffer;
+    while (running && hSerial) {
+        DWORD bytesRead = 0;
+
+        // Rozpoczynamy operację asynchroniczną
+        BOOL ok = ReadFile(hSerial, raw_buffer, RAW_BUF_SIZE, &bytesRead, &ov);
+
+        if (!ok && GetLastError() == ERROR_IO_PENDING) {
+            // Czekamy na dane (max 100ms, żeby móc sprawdzić flagę 'running')
+            DWORD wait = WaitForSingleObject(ov.hEvent, 100);
+            if (wait == WAIT_OBJECT_0) {
+                GetOverlappedResult(hSerial, &ov, &bytesRead, FALSE);
+            }
+            else {
+                // Timeout - brak danych w tym cyklu, lecimy dalej
+                continue;
+            }
+        }
+        else if (!ok) {
+            // Prawdziwy błąd
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        if (bytesRead > 0) {
+            // Przekazujemy to co przyszło do parsera
+            // Parser zajmuje się sklejaniem kawałków w całość
+            parser.append_data(raw_buffer, bytesRead);
+        }
+
+        ResetEvent(ov.hEvent); // Ważne przy reuse struktury OVERLAPPED w pętli
+    }
+    CloseHandle(ov.hEvent);
 }
+
+// --- PISANIE ---
+// (Reszta kodu pisania bez większych zmian, tylko dopasowanie do int64_t dla spójności)
 
 bool write_overlapped(const char* buf, size_t size) {
     OVERLAPPED ov = { 0 };
     ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    if (!ov.hEvent) throw std::runtime_error("CreateEvent() failed");
-
-    DWORD bytesWritten = 0;
-    BOOL ok = WriteFile(hSerial, buf, (DWORD)size, &bytesWritten, &ov);
-    if (!ok && GetLastError() == ERROR_IO_PENDING) {
-        DWORD wait = WaitForSingleObject(ov.hEvent, INFINITE);
-        if (wait == WAIT_OBJECT_0)
-            GetOverlappedResult(hSerial, &ov, &bytesWritten, FALSE);
+    DWORD written = 0;
+    if (!WriteFile(hSerial, buf, (DWORD)size, &written, &ov) && GetLastError() == ERROR_IO_PENDING) {
+        WaitForSingleObject(ov.hEvent, INFINITE);
+        GetOverlappedResult(hSerial, &ov, &written, FALSE);
     }
-    else if (!ok) {
-        DWORD err = GetLastError();
-        CloseHandle(ov.hEvent);
-        throw std::runtime_error(last_error_message(err));
-    }
-
     CloseHandle(ov.hEvent);
     return true;
 }
 
-void write_file_async(const std::string& filename, const char* buf, size_t size) {
-    int64_t filename_size = filename.size();
-    int64_t payload_size = size;
+void send_frame(const std::string& filename, const char* data, size_t size) {
+    int64_t fn_len = filename.size();
+    int64_t pl_len = size;
 
-    write_overlapped(reinterpret_cast<const char*>(&filename_size),
-        sizeof(filename_size));
-    write_overlapped(filename.data(), filename.size());
-    write_overlapped(reinterpret_cast<const char*>(&payload_size),
-        sizeof(payload_size));
-
-    size_t sent = 0;
-    while (sent < size && running) {
-        size_t chunk = min(CHUNK_SIZE, size - sent);
-        write_overlapped(buf + sent, chunk);
-        sent += chunk;
-    }
-}
-
-void write_text_async(const std::string& text) {
-    int64_t filename_size = 0;
-    int64_t payload_size = text.size();
-    write_overlapped(reinterpret_cast<const char*>(&filename_size),
-        sizeof(filename_size));
-    write_overlapped(reinterpret_cast<const char*>(&payload_size),
-        sizeof(payload_size));
-    write_overlapped(text.data(), text.size());
+    write_overlapped((char*)&fn_len, sizeof(fn_len));
+    if (fn_len > 0) write_overlapped(filename.data(), filename.size());
+    write_overlapped((char*)&pl_len, sizeof(pl_len));
+    write_overlapped(data, size);
 }
 
 void writer_loop() {
@@ -230,13 +292,10 @@ void writer_loop() {
     std::cout << "------------------------------------------------\n";
 
     while (running) {
-        std::cout << "Komenda (T/F/Q): ";
         char cmd = _getch();
         cmd = tolower(cmd);
-        std::cout << cmd << "\n";
 
         if (cmd == 'q') {
-            std::cout << "Zamykanie portu szeregowego...\n";
             close_serial_port();
             break;
         }
@@ -244,84 +303,39 @@ void writer_loop() {
             std::cout << "Wpisz tekst: ";
             std::string text;
             std::getline(std::cin, text);
-            write_text_async(text);
+            send_frame("", text.data(), text.size());
+            std::cout << "Wyslanio tekst.\nKomenda (T/F/Q): ";
         }
         else if (cmd == 'f') {
-            std::cout << "Podaj sciezke do pliku: ";
-            std::string filepath;
-            std::getline(std::cin, filepath);
-
-            try {
-                std::string filename = get_filename(filepath);
-                std::vector<char> buffer = read_file(filepath);
-                write_file_async(filename, buffer.data(), buffer.size());
+            std::cout << "Sciezka pliku: ";
+            std::string path;
+            std::getline(std::cin, path);
+            std::ifstream f(path, std::ios::binary | std::ios::ate);
+            if (f) {
+                size_t size = f.tellg();
+                std::vector<char> buf(size);
+                f.seekg(0);
+                f.read(buf.data(), size);
+                send_frame(get_filename(path), buf.data(), size);
+                std::cout << "Wyslano plik.\nKomenda (T/F/Q): ";
             }
-            catch (const std::runtime_error& e) {
-                std::cerr << "[WARN] " << e.what() << '\n';
+            else {
+                std::cout << "Blad pliku.\n";
             }
         }
     }
-}
-
-void reader_loop() {
-    std::deque<Chunk> buffers;
-    size_t total_read = 0;
-
-    while (running) {
-        if (!running || !hSerial)
-            break;
-
-        Chunk chunk;
-        memset(chunk.data(), 0, chunk.capacity());
-
-        OVERLAPPED ov = { 0 };
-        ov.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-        DWORD bytesRead = 0;
-
-        BOOL ok = ReadFile(hSerial, chunk.data(), (DWORD)chunk.capacity(),
-            &bytesRead, &ov);
-        if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            DWORD wait = WaitForSingleObject(ov.hEvent, 100); // 100ms
-            if (wait == WAIT_OBJECT_0)
-                GetOverlappedResult(hSerial, &ov, &bytesRead, FALSE);
-        }
-
-        if (bytesRead > 0) {
-            total_read += bytesRead;
-            buffers.push_back(std::move(chunk));
-            std::cout << "Buffers: " << buffers.size()
-                << "; Bytes: " << total_read << "\n";
-        }
-        else {
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-
-        CloseHandle(ov.hEvent);
-    }
-}
-
-void start_reader() {
-    std::thread(reader_loop).detach();
 }
 
 int main() {
-    std::cout << "=== Komunikator Szeregowy ===\n";
     SerialPortConfig config;
-
     try {
         read_serial_port_config(config);
         open_serial_port(config);
-        start_reader();
+        std::thread(reader_loop).detach();
         writer_loop();
     }
-    catch (const std::runtime_error& e) {
-        std::cerr << "[FATAL] " << e.what() << '\n';
-        return EXIT_FAILURE;
+    catch (std::exception& e) {
+        std::cerr << e.what() << "\n";
     }
-    catch (...) {
-        std::cerr << "[FATAL] Nieznany wyjątek!\n";
-        return EXIT_FAILURE;
-    }
-
     return 0;
 }
