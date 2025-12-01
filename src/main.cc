@@ -68,7 +68,6 @@ class FrameParser {
     int64_t temp_payload_len = 0;
 
 public:
-    // Wrzucamy surowe dane z ReadFile do środka
     void append_data(const char* data, size_t size) {
         buffer.insert(buffer.end(), data, data + size);
         process();
@@ -240,7 +239,6 @@ void reader_loop() {
             }
         }
         else if (!ok) {
-            // Prawdziwy błąd
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
