@@ -8,11 +8,3 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_executable(rs
   src/main.cc
 )
-
-add_subdirectory(deps/ftxui)
-
-target_link_libraries(rs
-  PRIVATE ftxui::screen
-  PRIVATE ftxui::dom
-  PRIVATE ftxui::component
-)
