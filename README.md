@@ -1,5 +1,7 @@
 # **🔌 Asynchroniczny Komunikator Szeregowy (WinAPI)**
 
+> ⚠️ Projekt zaliczeniowy, kod służy jedynie celom demonstracyjnym i zawiera uproszczenia.
+
 Prosta aplikacja konsolowa (CLI) w języku C++ do dwukierunkowej komunikacji przez port szeregowy (UART/RS-232/COM) na systemie Windows. Program umożliwia przesyłanie wiadomości tekstowych oraz plików binarnych.
 
 Projekt demonstruje wykorzystanie **asynchronicznego wejścia/wyjścia (Overlapped I/O)** oraz parsowanie strumieniowe oparte na **Maszynie Stanów**.
