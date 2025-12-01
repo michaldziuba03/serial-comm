@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 
 struct SerialPortConfig {
     std::string portName;
-    int baudRate = CBR_115200;
+    int baudRate = CBR_256000;
 };
 
 HANDLE hSerial = nullptr;
@@ -173,6 +173,16 @@ private:
     }
 };
 
+bool is_standard_baudrate(int baudRate) {
+    static const std::vector<int> standardRates = {
+        110, 300, 600, 1200, 2400, 4800, 9600,
+        14400, 19200, 38400, 57600, 115200, 128000, 256000,
+        460800, 921600, 1000000, 1500000, 2000000, 3000000
+    };
+
+    return std::find(standardRates.begin(), standardRates.end(), baudRate) != standardRates.end();
+}
+
 void read_serial_port_config(SerialPortConfig& config) {
     const char* defaultPort = "COM1";
     std::string portNameStr;
@@ -180,11 +190,15 @@ void read_serial_port_config(SerialPortConfig& config) {
     std::getline(std::cin, portNameStr);
     if (portNameStr.empty()) portNameStr = defaultPort;
 
-    std::cout << "Podaj baudrate (domyslnie 115200): ";
+    std::cout << "Podaj baudrate (domyslnie " << config.baudRate << "): ";
     std::string baudStr;
     std::getline(std::cin, baudStr);
     config.portName = portNameStr;
     if (!baudStr.empty()) config.baudRate = std::stoi(baudStr);
+
+    if (!is_standard_baudrate(config.baudRate)) {
+        std::cout << "[WARN] Wybrano niestandardowa wartosc baud rate\n";
+    }
 }
 
 void open_serial_port(SerialPortConfig& config) {
