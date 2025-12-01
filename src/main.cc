@@ -10,21 +10,18 @@
 #include <filesystem>
 #include <atomic>
 #include <cstdint>
-#include <cstring> // dla memcpy
+#include <cstring>
 
 namespace fs = std::filesystem;
 
-// --- KONFIGURACJA ---
 struct SerialPortConfig {
     std::string portName;
     int baudRate = CBR_115200;
 };
 
-// --- ZMIENNE GLOBALNE ---
 HANDLE hSerial = nullptr;
 std::atomic<bool> running = true;
 
-// --- POMOCNICZE ---
 inline std::string last_error_message(DWORD err) {
     LPVOID msg_buf = nullptr;
     FormatMessageA(
@@ -41,7 +38,20 @@ inline std::string get_filename(std::string& filepath) {
     return (separator == std::string::npos) ? filepath : filepath.substr(separator + 1);
 }
 
-// --- KLASA PARSUJĄCA DANE ---
+void draw_progress_bar(float progress, const std::string& label) {
+    int barWidth = 40;
+    std::cout << "\r" << label << " [";
+    int pos = barWidth * progress;
+    for (int i = 0; i < barWidth; ++i) {
+        if (i < pos) std::cout << "=";
+        else if (i == pos) std::cout << ">";
+        else std::cout << " ";
+    }
+
+    std::cout << "] " << int(min(progress, 1.0f) * 100.0) << " %";
+    std::cout.flush();
+}
+
 class FrameParser {
     enum class State {
         READ_FILENAME_LEN,
@@ -51,9 +61,8 @@ class FrameParser {
     };
 
     State state = State::READ_FILENAME_LEN;
-    std::deque<char> buffer; // Główny bufor strumieniowy
+    std::deque<char> buffer;
 
-    // Zmienne tymczasowe do trzymania stanu ramki
     int64_t temp_filename_len = 0;
     std::string temp_filename;
     int64_t temp_payload_len = 0;
@@ -62,27 +71,22 @@ public:
     // Wrzucamy surowe dane z ReadFile do środka
     void append_data(const char* data, size_t size) {
         buffer.insert(buffer.end(), data, data + size);
-        process(); // Próbujemy parsować po dodaniu nowych danych
+        process();
     }
 
 private:
-    // Funkcja pomocnicza do pobierania int64 z przodu kolejki
     bool try_read_int64(int64_t& out_value) {
         if (buffer.size() < sizeof(int64_t)) return false;
 
-        // Kopiujemy bajty do zmiennej (zakładamy Little Endian, standard na x86/Windows)
-        // Robimy to ręcznie lub przez vector, żeby deque było ciągłe w pamięci dla memcpy
         std::vector<char> raw(sizeof(int64_t));
         for (size_t i = 0; i < sizeof(int64_t); ++i) raw[i] = buffer[i];
 
         std::memcpy(&out_value, raw.data(), sizeof(int64_t));
 
-        // Usuwamy zużyte bajty
         buffer.erase(buffer.begin(), buffer.begin() + sizeof(int64_t));
         return true;
     }
 
-    // Funkcja pomocnicza do pobierania N bajtów (string/blob)
     bool try_read_bytes(size_t length, std::vector<char>& out_bytes) {
         if (buffer.size() < length) return false;
 
@@ -96,12 +100,10 @@ private:
 
     void handle_complete_frame(const std::string& name, const std::vector<char>& payload) {
         if (name.empty()) {
-            // WIADOMOŚĆ TEKSTOWA
             std::string text(payload.begin(), payload.end());
             std::cout << "\n[MSG] >> " << text << "\nKomenda (T/F/Q): ";
         }
         else {
-            // PLIK
             fs::create_directories("received_files");
             fs::path path = fs::path("received_files") / name;
 
@@ -114,22 +116,16 @@ private:
             }
         }
     }
-
+    
     void process() {
         while (true) {
             switch (state) {
             case State::READ_FILENAME_LEN:
-                if (!try_read_int64(temp_filename_len)) return; // Czekamy na więcej danych
-
-                // Sanity check
-                if (temp_filename_len < 0 || temp_filename_len > 1024) {
-                    // Tutaj można dodać logikę resetu, jeśli otrzymamy śmieci
-                    // Na razie ufamy, że długość jest OK
-                }
+                if (!try_read_int64(temp_filename_len)) return;
 
                 if (temp_filename_len == 0) {
                     temp_filename = "";
-                    state = State::READ_PAYLOAD_LEN; // Pomijamy czytanie nazwy
+                    state = State::READ_PAYLOAD_LEN;
                 }
                 else {
                     state = State::READ_FILENAME;
@@ -147,18 +143,26 @@ private:
 
             case State::READ_PAYLOAD_LEN:
                 if (!try_read_int64(temp_payload_len)) return;
+
+                if (!temp_filename.empty()) {
+                    std::cout << "\n[INFO] Odbieranie: " << temp_filename << " (" << temp_payload_len << " B)\n";
+                }
                 state = State::READ_PAYLOAD;
                 break;
 
             case State::READ_PAYLOAD:
             {
+                if (!temp_filename.empty() && temp_payload_len > 0) {
+                    float progress = (float)buffer.size() / (float)temp_payload_len;
+                    draw_progress_bar(progress, "Pobieranie");
+                }
+
                 std::vector<char> payload_buf;
                 if (!try_read_bytes(static_cast<size_t>(temp_payload_len), payload_buf)) return;
+                if (!temp_filename.empty()) std::cout << "\n";
 
-                // Mamy całą ramkę!
                 handle_complete_frame(temp_filename, payload_buf);
 
-                // Reset maszyny stanów
                 state = State::READ_FILENAME_LEN;
                 temp_filename.clear();
                 temp_filename_len = 0;
@@ -169,8 +173,6 @@ private:
         }
     }
 };
-
-// --- OBSŁUGA PORTU ---
 
 void read_serial_port_config(SerialPortConfig& config) {
     const char* defaultPort = "COM1";
@@ -215,12 +217,9 @@ void close_serial_port() {
     hSerial = NULL;
 }
 
-// --- NOWY READER LOOP ---
 void reader_loop() {
     FrameParser parser;
 
-    // Alokujemy jeden statyczny bufor do odczytu z API Windowsa
-    // Nie musimy go niszczyć i tworzyć od nowa.
     const size_t RAW_BUF_SIZE = 1024;
     char raw_buffer[RAW_BUF_SIZE];
 
@@ -229,18 +228,14 @@ void reader_loop() {
 
     while (running && hSerial) {
         DWORD bytesRead = 0;
-
-        // Rozpoczynamy operację asynchroniczną
         BOOL ok = ReadFile(hSerial, raw_buffer, RAW_BUF_SIZE, &bytesRead, &ov);
 
         if (!ok && GetLastError() == ERROR_IO_PENDING) {
-            // Czekamy na dane (max 100ms, żeby móc sprawdzić flagę 'running')
-            DWORD wait = WaitForSingleObject(ov.hEvent, 100);
+            DWORD wait = WaitForSingleObject(ov.hEvent, 150);
             if (wait == WAIT_OBJECT_0) {
                 GetOverlappedResult(hSerial, &ov, &bytesRead, FALSE);
             }
             else {
-                // Timeout - brak danych w tym cyklu, lecimy dalej
                 continue;
             }
         }
@@ -251,18 +246,13 @@ void reader_loop() {
         }
 
         if (bytesRead > 0) {
-            // Przekazujemy to co przyszło do parsera
-            // Parser zajmuje się sklejaniem kawałków w całość
             parser.append_data(raw_buffer, bytesRead);
         }
 
-        ResetEvent(ov.hEvent); // Ważne przy reuse struktury OVERLAPPED w pętli
+        ResetEvent(ov.hEvent);
     }
     CloseHandle(ov.hEvent);
 }
-
-// --- PISANIE ---
-// (Reszta kodu pisania bez większych zmian, tylko dopasowanie do int64_t dla spójności)
 
 bool write_overlapped(const char* buf, size_t size) {
     OVERLAPPED ov = { 0 };
@@ -276,14 +266,33 @@ bool write_overlapped(const char* buf, size_t size) {
     return true;
 }
 
-void send_frame(const std::string& filename, const char* data, size_t size) {
-    int64_t fn_len = filename.size();
-    int64_t pl_len = size;
+void send_text_frame(const std::string& text) {
+    int64_t fn_len = 0;
+    int64_t pl_len = text.size();
 
     write_overlapped((char*)&fn_len, sizeof(fn_len));
-    if (fn_len > 0) write_overlapped(filename.data(), filename.size());
     write_overlapped((char*)&pl_len, sizeof(pl_len));
-    write_overlapped(data, size);
+    write_overlapped(text.data(), text.size());
+}
+
+void send_file_frame(const std::string& filename, const std::vector<char>& data) {
+    int64_t fn_len = filename.size();
+    int64_t pl_len = data.size();
+
+    write_overlapped((char*)&fn_len, sizeof(fn_len));
+    write_overlapped(filename.data(), filename.size());
+    write_overlapped((char*)&pl_len, sizeof(pl_len));
+
+    size_t sent = 0;
+    size_t total = data.size();
+    const size_t CHUNK = 2048;
+
+    while (sent < total && running) {
+        size_t to_send = min(CHUNK, total - sent);
+        write_overlapped(data.data() + sent, to_send);
+        sent += to_send;
+    }
+    std::cout << "\n[INFO] Zakonczono wysylanie.\n";
 }
 
 void writer_loop() {
@@ -303,7 +312,7 @@ void writer_loop() {
             std::cout << "Wpisz tekst: ";
             std::string text;
             std::getline(std::cin, text);
-            send_frame("", text.data(), text.size());
+            send_text_frame(text);
             std::cout << "Wyslanio tekst.\nKomenda (T/F/Q): ";
         }
         else if (cmd == 'f') {
@@ -316,8 +325,10 @@ void writer_loop() {
                 std::vector<char> buf(size);
                 f.seekg(0);
                 f.read(buf.data(), size);
-                send_frame(get_filename(path), buf.data(), size);
-                std::cout << "Wyslano plik.\nKomenda (T/F/Q): ";
+
+                send_file_frame(get_filename(path), buf);
+
+                std::cout << "Komenda (T/F/Q): ";
             }
             else {
                 std::cout << "Blad pliku.\n";
